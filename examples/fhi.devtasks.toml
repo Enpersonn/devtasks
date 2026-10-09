@@ -1,0 +1,22 @@
+# Named development processes used by the `devtasks` Zellij integration.
+# Run all defaults with: devtasks start
+
+default = ["api", "frontend", "minimetode"]
+
+[tasks.api]
+label = "API"
+command = ["dotnet", "run", "--project", "src/Fhi.Web/Fhi.Web.csproj"]
+cwd = "."
+ready_after = 5
+
+[tasks.frontend]
+label = "Frontend"
+command = ["npm", "run", "build-watch"]
+cwd = "src/Fhi.Web/Frontend"
+ready_after = 3
+
+[tasks.minimetode]
+label = "MiniMetode"
+command = ["npm", "run", "minimetode-watch-coupled"]
+cwd = "src/FHI.MM.Frontend"
+ready_after = 3

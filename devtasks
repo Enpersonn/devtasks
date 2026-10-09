@@ -1,0 +1,763 @@
+#!/usr/bin/env python3
+"""Small project task runner backed by stacked panes in a Zellij task tab.
+
+Projects opt in with a .devtasks.toml file. Zellij owns the task panes while
+this command stores enough session state to start, stop, focus and render them
+in zjstatus.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
+
+CONFIG_NAME = ".devtasks.toml"
+ACTIVE_STATES = {"starting", "running"}
+COLORS = {
+    "starting": "#f9e2af",
+    "running": "#a6e3a1",
+    "failed": "#f38ba8",
+    "stopped": "#6c7086",
+}
+
+
+class DevtasksError(RuntimeError):
+    pass
+
+
+def zellij_session() -> str:
+    return os.environ.get("ZELLIJ_SESSION_NAME", "").strip()
+
+
+def require_zellij() -> str:
+    session = zellij_session()
+    if not session or os.environ.get("ZELLIJ") not in {"0", "true", "1"}:
+        raise DevtasksError("this command must run inside a Zellij session")
+    return session
+
+
+def state_paths() -> tuple[Path, Path]:
+    session = zellij_session() or "outside-zellij"
+    digest = hashlib.sha256(session.encode()).hexdigest()[:12]
+    base = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/devtasks-{os.getuid()}")) / "devtasks"
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return base / f"{digest}.json", base / f"{digest}.lock"
+
+
+@contextmanager
+def locked_state() -> Iterator[dict[str, Any]]:
+    state_path, lock_path = state_paths()
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                state = {"session": zellij_session(), "projects": {}}
+            state.setdefault("projects", {})
+            yield state
+            fd, temporary = tempfile.mkstemp(prefix=state_path.name, dir=state_path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    json.dump(state, output, indent=2, sort_keys=True)
+                    output.write("\n")
+                os.replace(temporary, state_path)
+            finally:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def read_state() -> dict[str, Any]:
+    state_path, _ = state_paths()
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"session": zellij_session(), "projects": {}}
+    state.setdefault("projects", {})
+    return state
+
+
+def find_root(start: str | Path | None = None) -> Path:
+    requested = Path(start or os.environ.get("DEVTASKS_ROOT", Path.cwd())).expanduser()
+    requested = requested.resolve()
+    if requested.is_file():
+        requested = requested.parent
+    for candidate in (requested, *requested.parents):
+        if (candidate / CONFIG_NAME).is_file():
+            return candidate
+    raise DevtasksError(f"no {CONFIG_NAME} found from {requested}")
+
+
+def load_config(root: Path) -> dict[str, Any]:
+    path = root / CONFIG_NAME
+    try:
+        with path.open("rb") as source:
+            config = tomllib.load(source)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise DevtasksError(f"cannot load {path}: {error}") from error
+
+    tasks = config.get("tasks")
+    if not isinstance(tasks, dict) or not tasks:
+        raise DevtasksError(f"{path} must define at least one [tasks.NAME] table")
+
+    for name, task in tasks.items():
+        if not isinstance(task, dict):
+            raise DevtasksError(f"tasks.{name} must be a table")
+        command = task.get("command")
+        if not isinstance(command, (str, list)) or not command:
+            raise DevtasksError(f"tasks.{name}.command must be a string or a non-empty array")
+        if isinstance(command, list) and not all(isinstance(value, str) for value in command):
+            raise DevtasksError(f"tasks.{name}.command array may only contain strings")
+        cwd = (root / task.get("cwd", ".")).resolve()
+        if not cwd.is_dir():
+            raise DevtasksError(f"tasks.{name}.cwd does not exist: {cwd}")
+        dependencies = task.get("depends_on", [])
+        if not isinstance(dependencies, list) or not all(isinstance(value, str) for value in dependencies):
+            raise DevtasksError(f"tasks.{name}.depends_on must be an array of task names")
+        missing = [value for value in dependencies if value not in tasks]
+        if missing:
+            raise DevtasksError(f"tasks.{name} has unknown dependencies: {', '.join(missing)}")
+
+    defaults = config.get("default", list(tasks))
+    if not isinstance(defaults, list) or not all(isinstance(value, str) for value in defaults):
+        raise DevtasksError("default must be an array of task names")
+    missing_defaults = [value for value in defaults if value not in tasks]
+    if missing_defaults:
+        raise DevtasksError(f"default contains unknown tasks: {', '.join(missing_defaults)}")
+    config["default"] = defaults
+    return config
+
+
+def task_order(config: dict[str, Any], selected: list[str]) -> list[str]:
+    tasks = config["tasks"]
+    unknown = [name for name in selected if name not in tasks]
+    if unknown:
+        raise DevtasksError(f"unknown task(s): {', '.join(unknown)}")
+
+    ordered: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            raise DevtasksError(f"dependency cycle involving {name}")
+        visiting.add(name)
+        for dependency in tasks[name].get("depends_on", []):
+            visit(dependency)
+        visiting.remove(name)
+        visited.add(name)
+        ordered.append(name)
+
+    for name in selected:
+        visit(name)
+    return ordered
+
+
+def normalize_pane_id(value: str | int | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text if text.startswith("terminal_") else f"terminal_{text}"
+
+
+def task_label(name: str, task: dict[str, Any]) -> str:
+    return str(task.get("label", name))
+
+
+def update_project(root: Path, **updates: Any) -> None:
+    with locked_state() as state:
+        project = state["projects"].setdefault(str(root), {"name": root.name, "tasks": {}})
+        project.update(updates)
+        project["name"] = root.name
+        project["updated_at"] = time.time()
+
+
+def update_task(root: Path, name: str, **updates: Any) -> None:
+    with locked_state() as state:
+        projects = state["projects"]
+        project = projects.setdefault(str(root), {"name": root.name, "tasks": {}})
+        project["name"] = root.name
+        project["updated_at"] = time.time()
+        record = project.setdefault("tasks", {}).setdefault(name, {})
+        record.update(updates)
+        record["updated_at"] = time.time()
+
+
+def run_zellij(arguments: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+    session_arguments = ["--session", zellij_session()] if zellij_session() else []
+    command = ["zellij", *session_arguments, "action", *arguments]
+    return subprocess.run(
+        command,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
+    )
+
+
+def current_tab_id() -> int:
+    result = run_zellij(["current-tab-info", "--json"], capture=True)
+    try:
+        return int(json.loads(result.stdout)["tab_id"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise DevtasksError("could not determine the current Zellij tab") from error
+
+
+def tab_snapshot() -> dict[int, dict[str, Any]]:
+    result = run_zellij(["list-tabs", "--json"], capture=True, check=False)
+    if result.returncode != 0:
+        return {}
+    try:
+        return {int(tab["tab_id"]): tab for tab in json.loads(result.stdout)}
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return {}
+
+
+def pane_snapshot() -> dict[str, dict[str, Any]]:
+    if not zellij_session():
+        return {}
+    result = run_zellij(["list-panes", "--all", "--json"], capture=True, check=False)
+    if result.returncode != 0:
+        return {}
+    try:
+        panes = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+    return {
+        f"terminal_{pane['id']}": pane
+        for pane in panes
+        if not pane.get("is_plugin", False) and pane.get("id") is not None
+    }
+
+
+def reconcile_state(*, max_age: float = 0) -> dict[str, Any]:
+    with locked_state() as state:
+        now = time.time()
+        if max_age and now - float(state.get("reconciled_at", 0)) < max_age:
+            return json.loads(json.dumps(state))
+        panes = pane_snapshot()
+        state["reconciled_at"] = now
+        for project in state["projects"].values():
+            for record in project.get("tasks", {}).values():
+                pane_id = normalize_pane_id(record.get("pane_id"))
+                if not pane_id:
+                    continue
+                pane = panes.get(pane_id)
+                if pane is None:
+                    updates: dict[str, Any] = {"pane_id": None, "updated_at": time.time()}
+                    if record.get("status") in ACTIVE_STATES:
+                        updates["status"] = "stopped"
+                    record.update(updates)
+                    continue
+                if pane.get("exited"):
+                    exit_code = pane.get("exit_status")
+                    record.update(
+                        status="stopped" if exit_code in (None, 0) else "failed",
+                        exit_code=exit_code,
+                        updated_at=time.time(),
+                    )
+        return json.loads(json.dumps(state))
+
+
+def is_task_active(record: dict[str, Any], panes: dict[str, dict[str, Any]]) -> bool:
+    pane_id = normalize_pane_id(record.get("pane_id"))
+    return bool(pane_id and pane_id in panes and not panes[pane_id].get("exited"))
+
+
+def ensure_task_tab(root: Path, state: dict[str, Any]) -> tuple[int, str | None]:
+    project = state["projects"].get(str(root), {})
+    existing_tab = project.get("tab_id")
+    task_tab_name = f"Tasks:{root.name}"
+    tabs = tab_snapshot()
+    if existing_tab is not None and tabs.get(int(existing_tab), {}).get("name") == task_tab_name:
+        return int(existing_tab), None
+
+    result = run_zellij(
+        ["new-tab", "--no-focus", "--name", task_tab_name, "--cwd", str(root)],
+        capture=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise DevtasksError(f"could not create task tab: {result.stderr.strip()}")
+    try:
+        tab_id = int(result.stdout.strip())
+    except ValueError as error:
+        raise DevtasksError("Zellij did not return the new task tab ID") from error
+
+    placeholder = None
+    for _ in range(10):
+        panes = pane_snapshot()
+        placeholder = next(
+            (pane_id for pane_id, pane in panes.items() if pane.get("tab_id") == tab_id),
+            None,
+        )
+        if placeholder:
+            break
+        time.sleep(0.05)
+    update_project(root, tab_id=tab_id)
+    return tab_id, placeholder
+
+
+def start_tasks(root: Path, selected: list[str] | None = None) -> None:
+    require_zellij()
+    config = load_config(root)
+    names = task_order(config, selected or config["default"])
+    panes = pane_snapshot()
+    state = read_state()
+    existing = state["projects"].get(str(root), {}).get("tasks", {})
+    pending = []
+    for name in names:
+        task = config["tasks"][name]
+        if is_task_active(existing.get(name, {}), panes):
+            print(f"{task_label(name, task)} is already running")
+        else:
+            pending.append(name)
+    if not pending:
+        return
+
+    tab_id, placeholder = ensure_task_tab(root, state)
+    started = 0
+    for name in pending:
+        task = config["tasks"][name]
+        cwd = (root / task.get("cwd", ".")).resolve()
+        label = task_label(name, task)
+        command = [
+            "new-pane",
+            "--stacked",
+            "--no-focus",
+            "--name",
+            label,
+            "--cwd",
+            str(cwd),
+            "--tab-id",
+            str(tab_id),
+            "--",
+            str(Path(__file__).resolve()),
+            "--root",
+            str(root),
+            "_run",
+            name,
+            "--task-tab-id",
+            str(tab_id),
+        ]
+        result = run_zellij(command, capture=True, check=False)
+        if result.returncode != 0:
+            update_task(root, name, label=label, status="failed", error=result.stderr.strip())
+            print(f"Could not start {label}: {result.stderr.strip()}", file=sys.stderr)
+            continue
+        match = re.search(r"terminal_\d+", result.stdout)
+        pane_id = match.group(0) if match else None
+        update_task(
+            root,
+            name,
+            label=label,
+            status="starting",
+            pane_id=pane_id,
+            tab_id=tab_id,
+            exit_code=None,
+            error=None,
+        )
+        print(f"Started {label}")
+        started += 1
+
+    if placeholder and started:
+        run_zellij(["close-pane", "--pane-id", placeholder], check=False)
+    elif placeholder and not started:
+        run_zellij(["close-tab", "--tab-id", str(tab_id)], check=False)
+        update_project(root, tab_id=None)
+
+
+def records_for(root: Path | None, selected: list[str] | None = None) -> list[tuple[Path, str, dict[str, Any]]]:
+    state = read_state()
+    records: list[tuple[Path, str, dict[str, Any]]] = []
+    for root_text, project in state["projects"].items():
+        project_root = Path(root_text)
+        if root is not None and project_root != root:
+            continue
+        for name, record in project.get("tasks", {}).items():
+            if not selected or name in selected:
+                records.append((project_root, name, record))
+    return records
+
+
+def stop_tasks(root: Path, selected: list[str] | None = None) -> None:
+    require_zellij()
+    config = load_config(root)
+    names = selected or config["default"]
+    unknown = [name for name in names if name not in config["tasks"]]
+    if unknown:
+        raise DevtasksError(f"unknown task(s): {', '.join(unknown)}")
+    records = {name: record for _, name, record in records_for(root, names)}
+    for name in names:
+        label = task_label(name, config["tasks"][name])
+        pane_id = normalize_pane_id(records.get(name, {}).get("pane_id"))
+        if pane_id:
+            run_zellij(["close-pane", "--pane-id", pane_id], check=False)
+        update_task(root, name, label=label, status="stopped", pane_id=None, exit_code=None)
+        print(f"Stopped {label}")
+
+    project = read_state()["projects"].get(str(root), {})
+    if not any(record.get("pane_id") for record in project.get("tasks", {}).values()):
+        tab_id = project.get("tab_id")
+        expected_name = f"Tasks:{root.name}"
+        if tab_id is not None and tab_snapshot().get(int(tab_id), {}).get("name") == expected_name:
+            run_zellij(["close-tab", "--tab-id", str(tab_id)], check=False)
+        update_project(root, tab_id=None)
+
+
+def restart_tasks(root: Path, selected: list[str] | None = None) -> None:
+    config = load_config(root)
+    names = selected or config["default"]
+    stop_tasks(root, names)
+    time.sleep(0.2)
+    start_tasks(root, names)
+
+
+def show_logs(root: Path | None, task_name: str | None = None) -> None:
+    require_zellij()
+    state = reconcile_state()
+    panes = pane_snapshot()
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for root_text, project in state["projects"].items():
+        if root is not None and Path(root_text) != root:
+            continue
+        for name, record in project.get("tasks", {}).items():
+            if task_name is None or name == task_name:
+                candidates.append((name, record))
+    if task_name and not candidates:
+        raise DevtasksError(f"no pane recorded for task {task_name}")
+    active = [(name, record) for name, record in candidates if record.get("pane_id")]
+    if not active:
+        raise DevtasksError("no task panes are available")
+    pane_id = normalize_pane_id(active[0][1].get("pane_id"))
+    if pane_id and panes.get(pane_id, {}).get("is_floating"):
+        tab_id = active[0][1].get("tab_id")
+        if tab_id is not None:
+            run_zellij(["show-floating-panes", "--tab-id", str(tab_id)], check=False)
+    if pane_id:
+        run_zellij(["focus-pane-id", pane_id], check=False)
+
+
+def bar_output() -> str:
+    state = reconcile_state(max_age=2) if zellij_session() else read_state()
+    projects = []
+    for root_text, project in state["projects"].items():
+        visible = []
+        for name, record in project.get("tasks", {}).items():
+            status = record.get("status", "stopped")
+            if status == "stopped" and not record.get("pane_id"):
+                continue
+            label = str(record.get("label", name)).replace("{", "").replace("}", "")
+            color = COLORS.get(status, COLORS["stopped"])
+            visible.append(f"#[fg={color}]● {label}")
+        if visible:
+            projects.append((Path(root_text).name, visible))
+    show_project = len(projects) > 1
+    output = []
+    for project_name, tasks in projects:
+        if show_project:
+            output.append(f"#[fg=#89b4fa,bold]{project_name}:")
+        output.extend(tasks)
+    return " ".join(output)
+
+
+def print_status(root: Path | None) -> None:
+    state = reconcile_state() if zellij_session() else read_state()
+    found = False
+    for root_text, project in state["projects"].items():
+        if root is not None and Path(root_text) != root:
+            continue
+        print(project.get("name", Path(root_text).name))
+        for name, record in project.get("tasks", {}).items():
+            found = True
+            suffix = f" (exit {record['exit_code']})" if record.get("exit_code") is not None else ""
+            print(f"  {record.get('status', 'stopped'):8} {record.get('label', name)}{suffix}")
+    if not found:
+        print("No recorded tasks")
+
+
+def process_command(task: dict[str, Any]) -> list[str]:
+    command = task["command"]
+    if isinstance(command, str):
+        shell = str(task.get("shell", os.environ.get("SHELL", "/bin/sh")))
+        return [shell, "-lc", command]
+    return list(command)
+
+
+def readiness_succeeded(ready: dict[str, Any]) -> bool:
+    kind = ready.get("type")
+    if kind == "tcp":
+        with socket.create_connection((str(ready.get("host", "127.0.0.1")), int(ready["port"])), timeout=1):
+            return True
+    if kind == "http":
+        context = None
+        if ready.get("insecure", False):
+            context = ssl._create_unverified_context()  # noqa: SLF001 - explicitly configured local HTTPS
+        request = urllib.request.Request(str(ready["url"]), method="GET")
+        with urllib.request.urlopen(request, timeout=2, context=context) as response:
+            return 200 <= response.status < 500
+    raise DevtasksError(f"unsupported readiness type: {kind!r}")
+
+
+def run_task(root: Path, name: str, task_tab_id: int | None) -> int:
+    config = load_config(root)
+    if name not in config["tasks"]:
+        raise DevtasksError(f"unknown task: {name}")
+    task = config["tasks"][name]
+    label = task_label(name, task)
+    cwd = (root / task.get("cwd", ".")).resolve()
+    pane_id = normalize_pane_id(os.environ.get("ZELLIJ_PANE_ID"))
+    update_task(
+        root,
+        name,
+        label=label,
+        status="starting",
+        pane_id=pane_id,
+        tab_id=task_tab_id,
+        exit_code=None,
+    )
+
+    environment = os.environ.copy()
+    configured_environment = task.get("env", {})
+    if not isinstance(configured_environment, dict):
+        raise DevtasksError(f"tasks.{name}.env must be a table")
+    environment.update({str(key): str(value) for key, value in configured_environment.items()})
+    command = process_command(task)
+    print(f"devtasks: {label}", flush=True)
+    print(f"cwd: {cwd}", flush=True)
+    print(f"command: {shlex.join(command)}\n", flush=True)
+
+    child: subprocess.Popen[Any] | None = None
+    stopping = threading.Event()
+    stop_requested = threading.Event()
+
+    def terminate(signum: int, _frame: Any) -> None:
+        stop_requested.set()
+        stopping.set()
+        if child is not None and child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM if signum != signal.SIGKILL else signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+    signal.signal(signal.SIGHUP, terminate)
+
+    try:
+        child = subprocess.Popen(command, cwd=cwd, env=environment, start_new_session=True)
+    except OSError as error:
+        update_task(root, name, status="failed", error=str(error), exit_code=127)
+        print(f"devtasks: failed to start: {error}", file=sys.stderr)
+        return 127
+
+    def mark_ready() -> None:
+        ready = task.get("ready")
+        if ready is None:
+            delay = float(task.get("ready_after", 1.0))
+            if not stopping.wait(max(delay, 0.0)) and child and child.poll() is None:
+                update_task(root, name, status="running", error=None)
+            return
+        if not isinstance(ready, dict):
+            update_task(root, name, status="failed", error="ready must be a table")
+            return
+        timeout = float(ready.get("timeout", 60))
+        deadline = time.monotonic() + timeout
+        last_error = "readiness check timed out"
+        while time.monotonic() < deadline and not stopping.is_set() and child and child.poll() is None:
+            try:
+                if readiness_succeeded(ready):
+                    update_task(root, name, status="running", error=None)
+                    return
+            except (OSError, KeyError, ValueError, urllib.error.URLError, DevtasksError) as error:
+                last_error = str(error)
+            stopping.wait(0.5)
+        if child and child.poll() is None and not stopping.is_set():
+            update_task(root, name, status="failed", error=last_error)
+
+    ready_thread = threading.Thread(target=mark_ready, daemon=True)
+    ready_thread.start()
+    return_code = child.wait()
+    stopping.set()
+    ready_thread.join(timeout=1)
+    final_status = "stopped" if stop_requested.is_set() or return_code == 0 else "failed"
+    update_task(root, name, status=final_status, exit_code=return_code)
+    if return_code != 0:
+        message = f"{label} exited with code {return_code}"
+        session_arguments = ["--session", zellij_session()] if zellij_session() else []
+        subprocess.run(
+            ["zellij", *session_arguments, "pipe", f"zjstatus::notify::{message}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    return return_code
+
+
+def menu(root: Path) -> None:
+    config = load_config(root)
+    while True:
+        state = reconcile_state()
+        records = state["projects"].get(str(root), {}).get("tasks", {})
+        print("\033[2J\033[H", end="")
+        print(f"Project tasks — {root.name}\n")
+        names = list(config["tasks"])
+        for index, name in enumerate(names, 1):
+            task = config["tasks"][name]
+            status = records.get(name, {}).get("status", "stopped")
+            print(f"  {index}. {task_label(name, task):24} [{status}]")
+        print("\n  a. Start defaults    x. Stop defaults")
+        print("  l. Show task logs    rN. Restart task N")
+        print("  sN. Stop task N      f. Restart failed")
+        print("  q. Close\n")
+        try:
+            choice = input("Choice: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choice in {"q", ""}:
+            return
+        if choice == "a":
+            start_tasks(root)
+            return
+        if choice == "x":
+            stop_tasks(root)
+            return
+        if choice == "l":
+            available = [(name, records.get(name, {})) for name in names if records.get(name, {}).get("pane_id")]
+            if not available:
+                input("No logs available. Press Enter...")
+                continue
+            for index, (name, _) in enumerate(available, 1):
+                print(f"  {index}. {task_label(name, config['tasks'][name])}")
+            selected = input("Log number: ").strip()
+            if selected.isdigit() and 1 <= int(selected) <= len(available):
+                show_logs(root, available[int(selected) - 1][0])
+                return
+            continue
+        if choice == "f":
+            failed = [name for name in names if records.get(name, {}).get("status") == "failed"]
+            if failed:
+                restart_tasks(root, failed)
+                return
+            input("No failed tasks. Press Enter...")
+            continue
+        if choice.startswith("r") or choice.startswith("s"):
+            action = choice[0]
+            selected = choice[1:].strip()
+            if not selected:
+                verb = "Restart" if action == "r" else "Stop"
+                selected = input(f"{verb} task number: ").strip()
+            if selected.isdigit() and 1 <= int(selected) <= len(names):
+                name = names[int(selected) - 1]
+                if action == "r":
+                    restart_tasks(root, [name])
+                else:
+                    stop_tasks(root, [name])
+                return
+            input("Invalid task number. Press Enter...")
+            continue
+        if choice.isdigit() and 1 <= int(choice) <= len(names):
+            name = names[int(choice) - 1]
+            if records.get(name, {}).get("pane_id"):
+                show_logs(root, name)
+            else:
+                start_tasks(root, [name])
+            return
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run project tasks in hidden Zellij panes")
+    parser.add_argument("--root", help=f"project directory containing {CONFIG_NAME}")
+    commands = parser.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start", help="start default or named tasks")
+    start.add_argument("tasks", nargs="*")
+    stop = commands.add_parser("stop", help="stop default or named tasks")
+    stop.add_argument("tasks", nargs="*")
+    restart = commands.add_parser("restart", help="restart default or named tasks")
+    restart.add_argument("tasks", nargs="*")
+    logs = commands.add_parser("logs", help="focus a task's log pane")
+    logs.add_argument("task", nargs="?")
+    commands.add_parser("menu", help="open the interactive task menu")
+    commands.add_parser("status", help="print task status")
+    commands.add_parser("bar", help="render task status for zjstatus")
+    internal = commands.add_parser("_run")
+    internal.add_argument("task")
+    internal.add_argument("--task-tab-id", type=int)
+    return parser
+
+
+def main() -> int:
+    parser = make_parser()
+    args = parser.parse_args()
+    try:
+        if args.command == "bar":
+            print(bar_output(), end="")
+            return 0
+
+        root: Path | None
+        try:
+            root = find_root(args.root)
+        except DevtasksError:
+            root = None
+            if args.command not in {"status", "logs"}:
+                raise
+
+        if args.command == "status":
+            print_status(root)
+        elif args.command == "start":
+            assert root is not None
+            start_tasks(root, args.tasks or None)
+        elif args.command == "stop":
+            assert root is not None
+            stop_tasks(root, args.tasks or None)
+        elif args.command == "restart":
+            assert root is not None
+            restart_tasks(root, args.tasks or None)
+        elif args.command == "logs":
+            show_logs(root, args.task)
+        elif args.command == "menu":
+            assert root is not None
+            menu(root)
+        elif args.command == "_run":
+            assert root is not None
+            return run_task(root, args.task, args.task_tab_id)
+        return 0
+    except DevtasksError as error:
+        print(f"devtasks: {error}", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() if error.stderr else str(error)
+        print(f"devtasks: Zellij command failed: {detail}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
